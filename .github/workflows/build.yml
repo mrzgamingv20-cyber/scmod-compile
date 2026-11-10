@@ -1,8 +1,14 @@
-name: Build scmod
+name: Build TreeFall scmod
 
 on:
   push:
+  pull_request:
   workflow_dispatch:
+
+env:
+  MOD_NAME: TreeFall
+  SRC_DIR: .        # folder berisi TreeFallLoader.cs, TreeFallPhysics.cs, modinfo.json
+  LIBS_DIR: libs    # folder berisi dll game: Survivalcraft.dll, Engine.dll, EntitySystem.dll (+ dll pendukung lain)
 
 jobs:
   build:
@@ -14,58 +20,73 @@ jobs:
       - name: Setup .NET 10
         uses: actions/setup-dotnet@v4
         with:
-          dotnet-version: "10.0.x"
+          dotnet-version: 10.0.x
 
-      - name: Patch project file
+      - name: Check inputs
         run: |
-          python3 - <<'EOF'
-          import glob, os, re
-          proj = sorted(glob.glob("*.csproj"))[0]
-          text = open(proj, encoding="utf-8-sig").read()
-          pattern = re.compile(r'[ \t]*<Compile\s+Include="([^"]+)"[^>]*?(?:/>|>\s*</Compile>)[ \t]*\r?\n?')
-          def drop(m):
-              path = m.group(1).replace("\\", "/")
-              if "*" in path or os.path.exists(path):
-                  return m.group(0)
-              print("Removing missing source:", path)
-              return ""
-          text = pattern.sub(drop, text)
-          add = '  <ItemGroup>\n    <Compile Include="SplitScreenFlip.cs" Condition="\'$(EnableDefaultCompileItems)\' == \'false\'" />\n  </ItemGroup>\n'
-          text = text.replace("</Project>", add + "</Project>")
-          open(proj, "w", encoding="utf-8").write(text)
+          set -e
+          for f in TreeFallLoader.cs TreeFallPhysics.cs modinfo.json; do
+            test -f "$SRC_DIR/$f" || { echo "::error::Missing $SRC_DIR/$f"; exit 1; }
+          done
+          for f in Survivalcraft.dll Engine.dll EntitySystem.dll; do
+            test -f "$LIBS_DIR/$f" || { echo "::error::Missing $LIBS_DIR/$f (game reference dll)"; exit 1; }
+          done
+          echo "Reference dlls:"; ls -la "$LIBS_DIR"
+
+      - name: Generate project file
+        run: |
+          mkdir -p _build
+          cat > _build/$MOD_NAME.csproj <<'EOF'
+          <Project Sdk="Microsoft.NET.Sdk">
+            <PropertyGroup>
+              <TargetFramework>net10.0</TargetFramework>
+              <OutputType>Library</OutputType>
+              <LangVersion>latest</LangVersion>
+              <Nullable>disable</Nullable>
+              <ImplicitUsings>disable</ImplicitUsings>
+              <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+              <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
+              <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+              <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
+              <NoWarn>$(NoWarn);CS0618;CS0649;CS0169;CS0414;CS1591;CS8981</NoWarn>
+              <DebugType>none</DebugType>
+              <CopyLocalLockFileAssemblies>false</CopyLocalLockFileAssemblies>
+            </PropertyGroup>
+            <ItemGroup>
+              <Compile Include="$(SrcDir)/*.cs" />
+              <GameDll Include="$(LibsDir)/*.dll" />
+              <Reference Include="@(GameDll)" Private="false" />
+            </ItemGroup>
+          </Project>
           EOF
-          echo "----- Patched project file -----"
-          cat ./*.csproj
-
-      - name: Find project file
-        id: proj
-        run: |
-          PROJ=$(ls ./*.csproj | head -n 1)
-          echo "Using project: $PROJ"
-          echo "path=$PROJ" >> "$GITHUB_OUTPUT"
-
-      - name: Restore
-        run: dotnet restore "${{ steps.proj.outputs.path }}"
 
       - name: Build
-        run: >
-          dotnet build "${{ steps.proj.outputs.path }}"
-          -c Release --no-restore
-          -p:AssemblyName=SplitScreenFlip
-          -o out
-
-      - name: Package scmod
         run: |
-          test -f out/SplitScreenFlip.dll
-          mkdir pack
-          cp out/SplitScreenFlip.dll pack/
-          cp modinfo.json pack/
-          (cd pack && zip -r ../SplitScreenFlip.scmod .)
-          echo "Package contents:"
-          unzip -l SplitScreenFlip.scmod
+          set -e
+          dotnet build _build/$MOD_NAME.csproj -c Release \
+            -p:AssemblyName=$MOD_NAME \
+            -p:SrcDir="$GITHUB_WORKSPACE/$SRC_DIR" \
+            -p:LibsDir="$GITHUB_WORKSPACE/$LIBS_DIR" \
+            -o _out
 
-      - name: Upload scmod
+      - name: Package .scmod
+        run: |
+          set -e
+          test -f "_out/$MOD_NAME.dll" || { echo "::error::$MOD_NAME.dll not produced"; exit 1; }
+          mkdir -p _pkg
+          cp "_out/$MOD_NAME.dll" _pkg/
+          cp "$SRC_DIR/modinfo.json" _pkg/
+          # Jangan sertakan dll milik game (aturan .scmod).
+          for g in Survivalcraft.dll Engine.dll EntitySystem.dll 0Harmony.dll; do
+            rm -f "_pkg/$g"
+          done
+          (cd _pkg && zip -r -9 "../$MOD_NAME.scmod" .)
+          echo "Contents of $MOD_NAME.scmod:"
+          unzip -l "$MOD_NAME.scmod"
+
+      - name: Upload .scmod
         uses: actions/upload-artifact@v4
         with:
-          name: SplitScreenFlip-scmod
-          path: SplitScreenFlip.scmod
+          name: ${{ env.MOD_NAME }}-scmod
+          path: ${{ env.MOD_NAME }}.scmod
+          if-no-files-found: error
