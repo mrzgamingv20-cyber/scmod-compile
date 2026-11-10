@@ -1,0 +1,12 @@
+{
+  "Name": "Split Screen Flip",
+  "Version": "1.0.0",
+  "ApiVersion": "1.9",
+  "Description": "Double Horizontal split screen: bottom screen stays normal, top screen is rotated 180 degrees.",
+  "ScVersion": "2.4.0.0",
+  "Author": "mrzgaming",
+  "Link": "",
+  "PackageName": "com.mrzgaming.splitscreenflip",
+  "LoadOrder": 0,
+  "Dependencies": []
+}
