@@ -1,12 +1,12 @@
 {
-  "Name": "Split Screen Flip",
-  "Version": "1.0.0",
+  "Name": "TreeFall",
+  "Version": "2.1.0",
   "ApiVersion": "1.9",
-  "Description": "Double Horizontal split screen: bottom screen stays normal, top screen is rotated 180 degrees.",
+  "Description": "Trees topple over with simple rigid-body physics when the base log is chopped (stage 2.1: tilted fall, no Harmony).",
   "ScVersion": "2.4.0.0",
-  "Author": "mrzgaming",
   "Link": "",
-  "PackageName": "com.mrzgaming.splitscreenflip",
+  "Author": "MrzGaming",
+  "PackageName": "com.mrzgaming.treefall",
   "LoadOrder": 0,
   "Dependencies": []
 }
