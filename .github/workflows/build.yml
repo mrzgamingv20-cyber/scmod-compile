@@ -16,6 +16,27 @@ jobs:
         with:
           dotnet-version: "10.0.x"
 
+      - name: Patch project file
+        run: |
+          python3 - <<'EOF'
+          import glob, os, re
+          proj = sorted(glob.glob("*.csproj"))[0]
+          text = open(proj, encoding="utf-8-sig").read()
+          pattern = re.compile(r'[ \t]*<Compile\s+Include="([^"]+)"[^>]*?(?:/>|>\s*</Compile>)[ \t]*\r?\n?')
+          def drop(m):
+              path = m.group(1).replace("\\", "/")
+              if "*" in path or os.path.exists(path):
+                  return m.group(0)
+              print("Removing missing source:", path)
+              return ""
+          text = pattern.sub(drop, text)
+          add = '  <ItemGroup>\n    <Compile Include="SplitScreenFlip.cs" Condition="\'$(EnableDefaultCompileItems)\' == \'false\'" />\n  </ItemGroup>\n'
+          text = text.replace("</Project>", add + "</Project>")
+          open(proj, "w", encoding="utf-8").write(text)
+          EOF
+          echo "----- Patched project file -----"
+          cat ./*.csproj
+
       - name: Find project file
         id: proj
         run: |
@@ -48,4 +69,3 @@ jobs:
         with:
           name: SplitScreenFlip-scmod
           path: SplitScreenFlip.scmod
-        
