@@ -2,13 +2,10 @@ name: Build TreeFall scmod
 
 on:
   push:
-  pull_request:
   workflow_dispatch:
 
 env:
   MOD_NAME: TreeFall
-  SRC_DIR: .        # folder berisi TreeFallLoader.cs, TreeFallPhysics.cs, modinfo.json
-  LIBS_DIR: libs    # folder berisi dll game: Survivalcraft.dll, Engine.dll, EntitySystem.dll (+ dll pendukung lain)
 
 jobs:
   build:
@@ -22,16 +19,31 @@ jobs:
         with:
           dotnet-version: 10.0.x
 
-      - name: Check inputs
+      - name: Locate sources and game dlls
         run: |
           set -e
-          for f in TreeFallLoader.cs TreeFallPhysics.cs modinfo.json; do
-            test -f "$SRC_DIR/$f" || { echo "::error::Missing $SRC_DIR/$f"; exit 1; }
+          echo "Files in repo:"
+          find . -type f -not -path './.git/*' | sort | head -100
+
+          LOADER=$(find . -type f -name 'TreeFallLoader.cs' -not -path './.git/*' | head -n1)
+          [ -n "$LOADER" ] || { echo "::error::TreeFallLoader.cs not found in repo"; exit 1; }
+          SRC=$(dirname "$LOADER")
+          for f in TreeFallPhysics.cs modinfo.json; do
+            [ -f "$SRC/$f" ] || { echo "::error::$f not found next to TreeFallLoader.cs ($SRC)"; exit 1; }
           done
-          for f in Survivalcraft.dll Engine.dll EntitySystem.dll; do
-            test -f "$LIBS_DIR/$f" || { echo "::error::Missing $LIBS_DIR/$f (game reference dll)"; exit 1; }
+
+          SC=$(find . -type f -iname 'Survivalcraft.dll' -not -path './.git/*' | head -n1)
+          [ -n "$SC" ] || { echo "::error::Survivalcraft.dll not found anywhere in repo. Upload Survivalcraft.dll, Engine.dll, EntitySystem.dll from the game APK."; exit 1; }
+          DLLDIR=$(dirname "$SC")
+          mkdir -p "$GITHUB_WORKSPACE/_refs"
+          cp "$DLLDIR"/*.dll "$GITHUB_WORKSPACE/_refs/"
+          for f in Engine.dll EntitySystem.dll; do
+            [ -n "$(find "$GITHUB_WORKSPACE/_refs" -iname "$f")" ] || { echo "::error::$f not found next to Survivalcraft.dll ($DLLDIR)"; exit 1; }
           done
-          echo "Reference dlls:"; ls -la "$LIBS_DIR"
+
+          echo "SRC_DIR=$GITHUB_WORKSPACE/$SRC" >> "$GITHUB_ENV"
+          echo "Source dir: $SRC"
+          echo "Reference dlls:"; ls -la "$GITHUB_WORKSPACE/_refs"
 
       - name: Generate project file
         run: |
@@ -50,11 +62,11 @@ jobs:
               <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
               <NoWarn>$(NoWarn);CS0618;CS0649;CS0169;CS0414;CS1591;CS8981</NoWarn>
               <DebugType>none</DebugType>
-              <CopyLocalLockFileAssemblies>false</CopyLocalLockFileAssemblies>
             </PropertyGroup>
             <ItemGroup>
-              <Compile Include="$(SrcDir)/*.cs" />
-              <GameDll Include="$(LibsDir)/*.dll" />
+              <Compile Include="$(SrcDir)/TreeFallLoader.cs" />
+              <Compile Include="$(SrcDir)/TreeFallPhysics.cs" />
+              <GameDll Include="$(RefsDir)/*.dll" />
               <Reference Include="@(GameDll)" Private="false" />
             </ItemGroup>
           </Project>
@@ -65,8 +77,8 @@ jobs:
           set -e
           dotnet build _build/$MOD_NAME.csproj -c Release \
             -p:AssemblyName=$MOD_NAME \
-            -p:SrcDir="$GITHUB_WORKSPACE/$SRC_DIR" \
-            -p:LibsDir="$GITHUB_WORKSPACE/$LIBS_DIR" \
+            -p:SrcDir="$SRC_DIR" \
+            -p:RefsDir="$GITHUB_WORKSPACE/_refs" \
             -o _out
 
       - name: Package .scmod
@@ -76,10 +88,6 @@ jobs:
           mkdir -p _pkg
           cp "_out/$MOD_NAME.dll" _pkg/
           cp "$SRC_DIR/modinfo.json" _pkg/
-          # Jangan sertakan dll milik game (aturan .scmod).
-          for g in Survivalcraft.dll Engine.dll EntitySystem.dll 0Harmony.dll; do
-            rm -f "_pkg/$g"
-          done
           (cd _pkg && zip -r -9 "../$MOD_NAME.scmod" .)
           echo "Contents of $MOD_NAME.scmod:"
           unzip -l "$MOD_NAME.scmod"
