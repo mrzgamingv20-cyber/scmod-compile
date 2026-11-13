@@ -1,11 +1,34 @@
-name: Build TreeFall scmod
+# Build a Survivalcraft .scmod with GitHub Actions.
+#
+# Repo layout expected:
+#   .github/workflows/build-scmod.yml   <- this file
+#   mod/RigidBody3D.cs                  <- mod sources (all .cs files in mod/ are used)
+#   mod/SubLevelPhysicsLoader.cs
+#   mod/modinfo.json
+#   (the official template project: *.csproj + nuget.config; if the repo has no csproj the template is cloned)
+#
+# Output: <MOD_NAME>.scmod (zip with <MOD_NAME>.dll + modinfo.json only) as a workflow artifact.
+name: Build scmod
 
 on:
-  push:
   workflow_dispatch:
+    inputs:
+      mod_name:
+        description: "Assembly name and .scmod file name"
+        required: false
+        default: "SubLevelPhysics"
+  push:
+    branches: [main]
+    paths:
+      - "mod/**"
+      - ".github/workflows/build-scmod.yml"
+
+permissions:
+  contents: read
 
 env:
-  MOD_NAME: TreeFall
+  MOD_NAME: ${{ github.event.inputs.mod_name || 'SubLevelPhysics' }}
+  MOD_SRC: mod
 
 jobs:
   build:
@@ -14,87 +37,102 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup .NET 10
+      - name: Setup .NET 10 SDK
         uses: actions/setup-dotnet@v4
         with:
-          dotnet-version: 10.0.x
+          dotnet-version: "10.0.x"
 
-      - name: Locate sources and game dlls
+      - name: Validate modinfo.json
         run: |
-          set -e
-          echo "Files in repo:"
-          find . -type f -not -path './.git/*' | sort | head -100
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, sys
+          path = os.path.join(os.environ["MOD_SRC"], "modinfo.json")
+          info = json.load(open(path, encoding="utf-8"))
+          required = ["Name", "Version", "ApiVersion", "Description", "ScVersion", "PackageName"]
+          missing = [k for k in required if k not in info]
+          if missing:
+              sys.exit("modinfo.json is missing: " + ", ".join(missing))
+          pkg = info["PackageName"]
+          if not pkg or ";" in pkg or "\n" in pkg or pkg.lower() in ("survivalcraft", "fastdebug"):
+              sys.exit("PackageName is not allowed: " + repr(pkg))
+          print("modinfo.json OK:", info["Name"], info["Version"], pkg)
+          PY
 
-          LOADER=$(find . -type f -name 'TreeFallLoader.cs' -not -path './.git/*' | head -n1)
-          [ -n "$LOADER" ] || { echo "::error::TreeFallLoader.cs not found in repo"; exit 1; }
-          SRC=$(dirname "$LOADER")
-          for f in TreeFallPhysics.cs modinfo.json; do
-            [ -f "$SRC/$f" ] || { echo "::error::$f not found next to TreeFallLoader.cs ($SRC)"; exit 1; }
-          done
-
-          SC=$(find . -type f -iname 'Survivalcraft.dll' -not -path './.git/*' | head -n1)
-          [ -n "$SC" ] || { echo "::error::Survivalcraft.dll not found anywhere in repo. Upload Survivalcraft.dll, Engine.dll, EntitySystem.dll from the game APK."; exit 1; }
-          DLLDIR=$(dirname "$SC")
-          mkdir -p "$GITHUB_WORKSPACE/_refs"
-          cp "$DLLDIR"/*.dll "$GITHUB_WORKSPACE/_refs/"
-          for f in Engine.dll EntitySystem.dll; do
-            [ -n "$(find "$GITHUB_WORKSPACE/_refs" -iname "$f")" ] || { echo "::error::$f not found next to Survivalcraft.dll ($DLLDIR)"; exit 1; }
-          done
-
-          echo "SRC_DIR=$GITHUB_WORKSPACE/$SRC" >> "$GITHUB_ENV"
-          echo "Source dir: $SRC"
-          echo "Reference dlls:"; ls -la "$GITHUB_WORKSPACE/_refs"
-
-      - name: Generate project file
+      - name: Locate template project
+        id: locate
         run: |
-          mkdir -p _build
-          cat > _build/$MOD_NAME.csproj <<'EOF'
-          <Project Sdk="Microsoft.NET.Sdk">
-            <PropertyGroup>
-              <TargetFramework>net10.0</TargetFramework>
-              <OutputType>Library</OutputType>
-              <LangVersion>latest</LangVersion>
-              <Nullable>disable</Nullable>
-              <ImplicitUsings>disable</ImplicitUsings>
-              <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
-              <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
-              <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
-              <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
-              <NoWarn>$(NoWarn);CS0618;CS0649;CS0169;CS0414;CS1591;CS8981</NoWarn>
-              <DebugType>none</DebugType>
-            </PropertyGroup>
-            <ItemGroup>
-              <Compile Include="$(SrcDir)/TreeFallLoader.cs" />
-              <Compile Include="$(SrcDir)/TreeFallPhysics.cs" />
-              <GameDll Include="$(RefsDir)/*.dll" />
-              <Reference Include="@(GameDll)" Private="false" />
-            </ItemGroup>
-          </Project>
-          EOF
+          set -euo pipefail
+          CSPROJ="$(find . -name '*.csproj' -not -path '*/obj/*' -not -path '*/bin/*' | head -n 1 || true)"
+          if [ -z "$CSPROJ" ]; then
+            echo "No csproj in the repo, cloning the official template"
+            git clone --depth 1 https://cnb.cool/SC-SPM/SurvivalcraftTemplateModForAPI.git template
+            CSPROJ="$(find template -name '*.csproj' -not -path '*/obj/*' | head -n 1)"
+          fi
+          test -n "$CSPROJ"
+          CSPROJ="$(readlink -f "$CSPROJ")"
+          echo "Using project: $CSPROJ"
+          echo "csproj=$CSPROJ" >> "$GITHUB_OUTPUT"
+          echo "dir=$(dirname "$CSPROJ")" >> "$GITHUB_OUTPUT"
+
+      - name: Prepare sources
+        working-directory: ${{ steps.locate.outputs.dir }}
+        env:
+          CSPROJ: ${{ steps.locate.outputs.csproj }}
+        run: |
+          set -euo pipefail
+          # Remove the template sample code and assets: they reference classes that we do not ship.
+          find . -name '*Template*.cs' -not -path './obj/*' -not -path './bin/*' -delete
+          rm -rf Assets
+          # Copy the mod sources.
+          cp "$GITHUB_WORKSPACE/$MOD_SRC"/*.cs .
+          cp "$GITHUB_WORKSPACE/$MOD_SRC/modinfo.json" ./modinfo.json
+          # Patch the project file: drop item entries that mention Template*, keep all properties.
+          python3 - <<'PY'
+          import os, re
+          p = os.environ["CSPROJ"]
+          s = open(p, encoding="utf-8").read()
+          items = r"(Compile|Content|EmbeddedResource|None|AdditionalFiles|Page)"
+          attr = r'[^>]*?(?:Include|Update)="[^"]*Template[^"]*"[^>]*?'
+          s = re.sub(r"<" + items + r"\b" + attr + r"/>", "", s)
+          s = re.sub(r"<" + items + r"\b" + attr + r">.*?</\1>", "", s, flags=re.S)
+          if re.search(r"<EnableDefaultCompileItems>\s*false", s, re.I):
+              s = s.replace("</Project>", '  <ItemGroup>\n    <Compile Include="*.cs" />\n  </ItemGroup>\n</Project>')
+          open(p, "w", encoding="utf-8").write(s)
+          print(s)
+          PY
+          ls -la
 
       - name: Build
+        working-directory: ${{ steps.locate.outputs.dir }}
+        env:
+          CSPROJ: ${{ steps.locate.outputs.csproj }}
         run: |
-          set -e
-          dotnet build _build/$MOD_NAME.csproj -c Release \
-            -p:AssemblyName=$MOD_NAME \
-            -p:SrcDir="$SRC_DIR" \
-            -p:RefsDir="$GITHUB_WORKSPACE/_refs" \
-            -o _out
+          set -euo pipefail
+          dotnet build "$CSPROJ" -c Release -v minimal \
+            -p:AssemblyName="$MOD_NAME" \
+            -p:Nullable=disable \
+            -p:ImplicitUsings=disable \
+            -p:TreatWarningsAsErrors=false
 
       - name: Package .scmod
+        env:
+          PROJECT_DIR: ${{ steps.locate.outputs.dir }}
         run: |
-          set -e
-          test -f "_out/$MOD_NAME.dll" || { echo "::error::$MOD_NAME.dll not produced"; exit 1; }
-          mkdir -p _pkg
-          cp "_out/$MOD_NAME.dll" _pkg/
-          cp "$SRC_DIR/modinfo.json" _pkg/
-          (cd _pkg && zip -r -9 "../$MOD_NAME.scmod" .)
-          echo "Contents of $MOD_NAME.scmod:"
-          unzip -l "$MOD_NAME.scmod"
+          set -euo pipefail
+          DLL="$(find "$PROJECT_DIR" -path '*/bin/Release/*' -name "$MOD_NAME.dll" | head -n 1)"
+          test -n "$DLL" || { echo "Built dll not found"; find "$PROJECT_DIR" -name '*.dll' -path '*/bin/*'; exit 1; }
+          echo "Built dll: $DLL"
+          mkdir -p out/pkg
+          cp "$DLL" out/pkg/
+          cp "$PROJECT_DIR/modinfo.json" out/pkg/
+          # The .scmod must contain only the mod dll and modinfo.json (never game/API dlls).
+          (cd out/pkg && zip -r "../$MOD_NAME.scmod" "$MOD_NAME.dll" modinfo.json)
+          unzip -l "out/$MOD_NAME.scmod"
 
       - name: Upload .scmod
         uses: actions/upload-artifact@v4
         with:
           name: ${{ env.MOD_NAME }}-scmod
-          path: ${{ env.MOD_NAME }}.scmod
+          path: out/*.scmod
           if-no-files-found: error
