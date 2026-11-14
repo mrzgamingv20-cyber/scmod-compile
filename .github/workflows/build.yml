@@ -1,62 +1,157 @@
-# Build a Survivalcraft .scmod with GitHub Actions.
+# Build a Survivalcraft .scmod with GitHub Actions - no file names to configure.
 #
-# Repo layout expected:
-#   .github/workflows/build-scmod.yml   <- this file
-#   mod/RigidBody3D.cs                  <- mod sources (all .cs files in mod/ are used)
-#   mod/SubLevelPhysicsLoader.cs
-#   mod/modinfo.json
-#   (the official template project: *.csproj + nuget.config; if the repo has no csproj the template is cloned)
+# Just upload your mod files anywhere in the repo (for example in mod/). The workflow finds the newest class that
+# extends ModLoader, then uses only the files that class needs (directly or indirectly) plus the nearest modinfo.json.
+# Old files from earlier versions that are no longer used are ignored automatically, so you never have to delete them.
+# The .scmod / dll name comes from "Name" in modinfo.json (or from the optional workflow input).
 #
-# Output: <MOD_NAME>.scmod (zip with <MOD_NAME>.dll + modinfo.json only) as a workflow artifact.
+# The official template (*.csproj + nuget.config) must be in the repo; if it is not, it is cloned.
+# Output: <name>.scmod (zip with <name>.dll + modinfo.json only) as a workflow artifact.
 name: Build scmod
 
 on:
   workflow_dispatch:
     inputs:
       mod_name:
-        description: "Assembly name and .scmod file name"
+        description: "Optional: assembly and .scmod name (default: from modinfo.json)"
         required: false
-        default: "SubLevelPhysics"
+        default: ""
   push:
     branches: [main]
     paths:
-      - "mod/**"
+      - "**/*.cs"
+      - "**/modinfo.json"
       - ".github/workflows/build-scmod.yml"
 
 permissions:
   contents: read
 
-env:
-  MOD_NAME: ${{ github.event.inputs.mod_name || 'SubLevelPhysics' }}
-  MOD_SRC: mod
-
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
+      - name: Checkout (full history, needed to find the newest files)
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Setup .NET 10 SDK
         uses: actions/setup-dotnet@v4
         with:
           dotnet-version: "10.0.x"
 
-      - name: Validate modinfo.json
+      - name: Detect mod files
+        env:
+          MOD_NAME_INPUT: ${{ github.event.inputs.mod_name }}
         run: |
           set -euo pipefail
           python3 - <<'PY'
-          import json, os, sys
-          path = os.path.join(os.environ["MOD_SRC"], "modinfo.json")
-          info = json.load(open(path, encoding="utf-8"))
-          required = ["Name", "Version", "ApiVersion", "Description", "ScVersion", "PackageName"]
-          missing = [k for k in required if k not in info]
+          import json, os, re, subprocess, sys
+
+          ROOT = os.getcwd()
+          EXCLUDE_DIRS = {".git", ".github", "obj", "bin", "out", "template", "node_modules"}
+          _time_cache = {}
+
+
+          def walk():
+              for d, dirs, files in os.walk(ROOT):
+                  dirs[:] = [x for x in dirs if x not in EXCLUDE_DIRS]
+                  for f in files:
+                      yield os.path.join(d, f)
+
+
+          def commit_time(path):
+              if path not in _time_cache:
+                  rel = os.path.relpath(path, ROOT)
+                  out = ""
+                  try:
+                      out = subprocess.run(["git", "log", "-1", "--format=%ct", "--", rel],
+                                           capture_output=True, text=True, cwd=ROOT).stdout.strip()
+                  except Exception:
+                      pass
+                  _time_cache[path] = int(out) if out else int(os.path.getmtime(path))
+              return _time_cache[path]
+
+
+          def strip(text):
+              text = re.sub(r"/\*.*?\*/", " ", text, flags=re.S)
+              return re.sub(r"//[^\n]*", " ", text)
+
+
+          # 1. candidate sources (template sample files are never candidates)
+          cs_files = [p for p in walk()
+                      if p.endswith(".cs") and "Template" not in os.path.basename(p) and "AssemblyInfo" not in os.path.basename(p)]
+          texts = {p: strip(open(p, encoding="utf-8-sig", errors="replace").read()) for p in cs_files}
+
+          # 2. declared types
+          decl = {}
+          for p, t in texts.items():
+              for m in re.finditer(r"\b(partial\s+)?(?:class|struct|interface|enum|record)\s+([A-Za-z_]\w*)", t):
+                  decl.setdefault(m.group(2), []).append((p, bool(m.group(1)) or "partial" in t[max(0, m.start() - 40):m.start() + 20]))
+
+          # 3. the newest ModLoader subclass is the root of the mod
+          loaders = [p for p, t in texts.items() if re.search(r"\bclass\s+\w+\s*:\s*[^{]*\bModLoader\b", t)]
+          if not loaders:
+              sys.exit("No ModLoader subclass found in the repo (outside template files).")
+          root = sorted(loaders, key=lambda p: (commit_time(p), p))[-1]
+
+          # 4. closure: every file that declares a type used by an included file
+          selected = {root}
+          queue = [root]
+          while queue:
+              cur = queue.pop()
+              idents = set(re.findall(r"[A-Za-z_]\w*", texts[cur]))
+              for name, owners in decl.items():
+                  if name not in idents:
+                      continue
+                  if any(partial for _, partial in owners):
+                      chosen = [p for p, _ in owners]
+                  else:
+                      chosen = [sorted(owners, key=lambda o: (commit_time(o[0]), o[0]))[-1][0]]
+                  for p in chosen:
+                      if p not in selected:
+                          selected.add(p)
+                          queue.append(p)
+
+          # 5. modinfo.json: next to the loader if present, otherwise the newest one
+          infos = [p for p in walk() if os.path.basename(p) == "modinfo.json"]
+          near = [p for p in infos if os.path.dirname(p) == os.path.dirname(root)]
+          pool = near or infos
+          if not pool:
+              sys.exit("No modinfo.json found in the repo.")
+          modinfo = sorted(pool, key=lambda p: (commit_time(p), p))[-1]
+
+          # 6. validate modinfo
+          info = json.load(open(modinfo, encoding="utf-8-sig"))
+          missing = [k for k in ["Name", "Version", "ApiVersion", "Description", "ScVersion", "PackageName"] if k not in info]
           if missing:
               sys.exit("modinfo.json is missing: " + ", ".join(missing))
           pkg = info["PackageName"]
           if not pkg or ";" in pkg or "\n" in pkg or pkg.lower() in ("survivalcraft", "fastdebug"):
               sys.exit("PackageName is not allowed: " + repr(pkg))
-          print("modinfo.json OK:", info["Name"], info["Version"], pkg)
+
+          # 7. mod name: workflow input, otherwise derived from modinfo.json
+          name = os.environ.get("MOD_NAME_INPUT", "").strip()
+          if not name:
+              name = re.sub(r"[^A-Za-z0-9_]", "", info["Name"]) or re.sub(r"[^A-Za-z0-9_]", "", pkg.split(".")[-1])
+          if not name or name[0].isdigit():
+              name = "Mod" + name
+
+          rel = lambda p: os.path.relpath(p, ROOT)
+          print("Mod name      :", name)
+          print("Loader (root) :", rel(root))
+          print("Selected files:")
+          for p in sorted(selected):
+              print("   +", rel(p))
+          print("Ignored files :")
+          for p in sorted(set(cs_files) - selected):
+              print("   -", rel(p))
+          print("modinfo.json  :", rel(modinfo))
+
+          list_path = os.path.join(os.environ.get("RUNNER_TEMP", "/tmp"), "selected.txt")
+          open(list_path, "w").write("\n".join(sorted(selected)) + "\n")
+          with open(os.environ.get("GITHUB_ENV", os.devnull), "a") as env:
+              env.write("MOD_NAME=%s\nMODINFO_PATH=%s\nSELECTED_LIST=%s\n" % (name, modinfo, list_path))
           PY
 
       - name: Locate template project
@@ -76,32 +171,60 @@ jobs:
           echo "dir=$(dirname "$CSPROJ")" >> "$GITHUB_OUTPUT"
 
       - name: Prepare sources
-        working-directory: ${{ steps.locate.outputs.dir }}
         env:
           CSPROJ: ${{ steps.locate.outputs.csproj }}
         run: |
           set -euo pipefail
-          # Remove the template sample code and assets: they reference classes that we do not ship.
-          find . -name '*Template*.cs' -not -path './obj/*' -not -path './bin/*' -delete
-          rm -rf Assets
-          # Copy the mod sources.
-          cp "$GITHUB_WORKSPACE/$MOD_SRC"/*.cs .
-          cp "$GITHUB_WORKSPACE/$MOD_SRC/modinfo.json" ./modinfo.json
-          # Patch the project file: drop item entries that mention Template*, keep all properties.
           python3 - <<'PY'
-          import os, re
-          p = os.environ["CSPROJ"]
-          s = open(p, encoding="utf-8").read()
+          import os, re, shutil
+
+          csproj = os.environ["CSPROJ"]
+          proj_dir = os.path.dirname(csproj)
+          selected = [l.strip() for l in open(os.environ["SELECTED_LIST"]) if l.strip()]
+          selected_real = {os.path.realpath(p) for p in selected}
+
+
+          def project_cs():
+              for d, dirs, files in os.walk(proj_dir):
+                  dirs[:] = [x for x in dirs if x not in ("obj", "bin")]
+                  for f in files:
+                      if f.endswith(".cs"):
+                          yield os.path.join(d, f)
+
+
+          # 1. remove every source in the project folder that is not part of the selected mod (old versions, template samples)
+          for p in list(project_cs()):
+              if os.path.realpath(p) not in selected_real:
+                  print("removing", os.path.relpath(p, proj_dir))
+                  os.remove(p)
+
+          # 2. copy selected sources that live outside the project folder
+          for p in selected:
+              if os.path.realpath(p).startswith(os.path.realpath(proj_dir) + os.sep):
+                  continue
+              target = os.path.join(proj_dir, os.path.basename(p))
+              if os.path.exists(target):
+                  target = os.path.join(proj_dir, re.sub(r"[^A-Za-z0-9_.]", "_", os.path.relpath(p)))
+              print("copying", p, "->", os.path.relpath(target, proj_dir))
+              shutil.copy(p, target)
+
+          # 3. modinfo.json and no template assets
+          dst = os.path.join(proj_dir, "modinfo.json")
+          if os.path.realpath(os.environ["MODINFO_PATH"]) != os.path.realpath(dst):
+              shutil.copy(os.environ["MODINFO_PATH"], dst)
+          shutil.rmtree(os.path.join(proj_dir, "Assets"), ignore_errors=True)
+
+          # 4. patch the project file: drop item entries that mention Template*, keep all properties
+          s = open(csproj, encoding="utf-8").read()
           items = r"(Compile|Content|EmbeddedResource|None|AdditionalFiles|Page)"
           attr = r'[^>]*?(?:Include|Update)="[^"]*Template[^"]*"[^>]*?'
           s = re.sub(r"<" + items + r"\b" + attr + r"/>", "", s)
           s = re.sub(r"<" + items + r"\b" + attr + r">.*?</\1>", "", s, flags=re.S)
           if re.search(r"<EnableDefaultCompileItems>\s*false", s, re.I):
-              s = s.replace("</Project>", '  <ItemGroup>\n    <Compile Include="*.cs" />\n  </ItemGroup>\n</Project>')
-          open(p, "w", encoding="utf-8").write(s)
+              s = s.replace("</Project>", '  <ItemGroup>\n    <Compile Include="**/*.cs" Exclude="obj/**;bin/**" />\n  </ItemGroup>\n</Project>')
+          open(csproj, "w", encoding="utf-8").write(s)
           print(s)
           PY
-          ls -la
 
       - name: Build
         working-directory: ${{ steps.locate.outputs.dir }}
