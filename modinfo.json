@@ -1,0 +1,12 @@
+{
+  "Name": "Fisika Sub-Level",
+  "Version": "0.3.0",
+  "ApiVersion": "1.9",
+  "Description": "Fisika blok mirip Sable: struktur dan pohon yang kehilangan penyangga jadi benda tegar yang jatuh dan berguling, lalu kembali jadi blok.",
+  "ScVersion": "2.4.0.0",
+  "Link": "",
+  "Author": "mrzgaming",
+  "PackageName": "com.mrzgaming.sublevelphysics",
+  "LoadOrder": 0,
+  "Dependencies": []
+}
