@@ -1,86 +1,340 @@
+# Universal scmod builder.
+#
+# Put your mod in the repo as ONE .zip file (for example mods/MyMod.zip). The zip can contain either
+#   - just the sources: .cs files + modinfo.json (any folder layout; old/unused .cs files inside the zip are ignored), or
+#   - a complete project with its own .csproj.
+# Run the workflow from the Actions tab and choose the mod in the "mod_zip" box:
+#   empty            -> the newest .zip in the repo
+#   MyMod / MyMod.zip / mods/MyMod.zip -> that zip
+#   all              -> every .zip in the repo, one .scmod each
+# The dll / .scmod name comes from "Name" in the zip's modinfo.json (or the optional "mod_name" box).
+# Sources-only zips are built with the official template project (*.csproj + nuget.config must be in the repo;
+# if the repo has no csproj the template is cloned). Output: out/<name>.scmod = mod dll + modinfo.json only.
 name: Build scmod (universal)
 
-# Put ONE mod zip in the repo root (it must contain *.cs files + modinfo.json).
-# The mod name is read from modinfo.json ("Name") and used for the dll and the .scmod file.
-
 on:
-  push:
   workflow_dispatch:
+    inputs:
+      mod_zip:
+        description: "Which mod zip: empty = newest, a file name (MyMod.zip), a path, or 'all'"
+        required: false
+        default: ""
+      mod_name:
+        description: "Optional: force the assembly / .scmod name (default: from modinfo.json)"
+        required: false
+        default: ""
+  push:
+    branches: [main]
+    paths:
+      - "**/*.zip"
+      - ".github/workflows/build-scmod.yml"
+
+permissions:
+  contents: read
 
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
+      - name: Checkout (full history, used to find the newest zip)
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Setup .NET 10
+      - name: Setup .NET 10 SDK
         uses: actions/setup-dotnet@v4
         with:
           dotnet-version: "10.0.x"
 
-      - name: Unpack mod zip
-        id: mod
+      - name: Build selected mod(s)
+        env:
+          MOD_ZIP_INPUT: ${{ github.event.inputs.mod_zip }}
+          MOD_NAME_INPUT: ${{ github.event.inputs.mod_name }}
         run: |
-          ZIP=$(ls ./*.zip 2>/dev/null | head -n 1 || true)
-          rm -rf modsrc && mkdir modsrc
-          if [ -n "$ZIP" ]; then
-            echo "Using zip: $ZIP"
-            unzip -q -o "$ZIP" -d modsrc
-          else
-            echo "No zip found, using loose files from repo root"
-            cp ./*.cs modsrc/ 2>/dev/null || true
-            cp ./modinfo.json modsrc/
-          fi
-          INFO=$(find modsrc -name modinfo.json | head -n 1)
-          test -n "$INFO" || { echo "modinfo.json not found"; exit 1; }
-          ROOT=$(dirname "$INFO")
-          NAME=$(python3 -c "import json,re,sys; n=json.load(open(sys.argv[1],encoding='utf-8-sig')).get('Name','Mod'); print(re.sub(r'[^A-Za-z0-9_]','',n) or 'Mod')" "$INFO")
-          echo "Mod name: $NAME"
-          echo "root=$ROOT" >> "$GITHUB_OUTPUT"
-          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, re, shutil, subprocess, sys, time, zipfile
 
-      - name: Patch project file
-        run: |
-          PROJ=$(ls ./*.csproj | head -n 1)
-          echo "Using project: $PROJ"
-          python3 - "$PROJ" <<'PY'
-          import re, sys, os
-          p = sys.argv[1]
-          s = open(p, encoding="utf-8").read()
-          def keep(m):
-              return m.group(0) if os.path.exists(m.group(1).replace("\\", "/")) else ""
-          s = re.sub(r'<Compile\s+Include="([^"]+)"\s*/>', keep, s)
-          add = '  <ItemGroup><Compile Remove="modsrc/**/*.cs" /><Compile Include="modsrc/**/*.cs" /></ItemGroup>\n'
-          if "modsrc/**" not in s:
-              s = s.replace("</Project>", add + "</Project>")
-          open(p, "w", encoding="utf-8").write(s)
+          WS = os.getcwd()
+          TEMP = os.environ.get("RUNNER_TEMP", "/tmp")
+          DOTNET = os.environ.get("DOTNET_CMD", "dotnet")
+          INPUT_ZIP = os.environ.get("MOD_ZIP_INPUT", "").strip()
+          INPUT_NAME = os.environ.get("MOD_NAME_INPUT", "").strip()
+          OUT = os.path.join(WS, "out")
+          EXCLUDE = {".git", ".github", "obj", "bin", "out", "template", "node_modules", "__mod"}
+          os.makedirs(OUT, exist_ok=True)
+
+
+          def walk(root, exclude=EXCLUDE):
+              for d, dirs, files in os.walk(root):
+                  dirs[:] = [x for x in dirs if x not in exclude]
+                  for f in files:
+                      yield os.path.join(d, f)
+
+
+          def commit_time(path):
+              try:
+                  out = subprocess.run(["git", "log", "-1", "--format=%ct", "--", os.path.relpath(path, WS)],
+                                       capture_output=True, text=True, cwd=WS).stdout.strip()
+                  if out:
+                      return int(out)
+              except Exception:
+                  pass
+              return int(os.path.getmtime(path))
+
+
+          def strip_comments(text):
+              text = re.sub(r"/\*.*?\*/", " ", text, flags=re.S)
+              return re.sub(r"//[^\n]*", " ", text)
+
+
+          # ------------------------------------------------------------------ 1. which zip(s)
+          def select_zips():
+              zips = sorted(p for p in walk(WS) if p.lower().endswith(".zip"))
+              rel = lambda p: os.path.relpath(p, WS)
+              if not zips:
+                  sys.exit("No .zip file found in the repo. Upload your mod as a .zip (for example into mods/).")
+              print("Mod zips in the repo:")
+              for p in zips:
+                  print("   *", rel(p))
+              sel = INPUT_ZIP
+              if not sel:
+                  newest = sorted(zips, key=lambda p: (commit_time(p), p))[-1]
+                  print("No zip chosen -> newest one:", rel(newest))
+                  return [newest]
+              if sel.lower() == "all":
+                  return zips
+              key = sel.lower().replace("\\", "/")
+              for test in (
+                  lambda p: rel(p).lower() == key,
+                  lambda p: os.path.basename(p).lower() == key,
+                  lambda p: os.path.splitext(os.path.basename(p))[0].lower() == key,
+                  lambda p: key in rel(p).lower(),
+              ):
+                  hit = [p for p in zips if test(p)]
+                  if hit:
+                      return hit[:1] if len(hit) == 1 else sorted(hit, key=lambda p: (commit_time(p), p))[-1:]
+              sys.exit("No zip matches '%s'. Available: %s" % (sel, ", ".join(rel(p) for p in zips)))
+
+
+          # ------------------------------------------------------------------ 2. template project
+          def locate_template():
+              cs = [p for p in walk(WS) if p.endswith(".csproj")]
+              if not cs:
+                  print("No csproj in the repo, cloning the official template")
+                  subprocess.run(["git", "clone", "--depth", "1", "https://cnb.cool/SC-SPM/SurvivalcraftTemplateModForAPI.git",
+                                  os.path.join(WS, "template")], check=True)
+                  cs = [p for p in walk(os.path.join(WS, "template"), {"obj", "bin"}) if p.endswith(".csproj")]
+              if not cs:
+                  sys.exit("No template csproj found.")
+              csproj = sorted(cs, key=lambda p: (len(p), p))[0]
+              print("Template project:", os.path.relpath(csproj, WS))
+              return os.path.relpath(csproj, WS)
+
+
+          # ------------------------------------------------------------------ 3. unzip
+          def unzip(zip_path, dest):
+              with zipfile.ZipFile(zip_path) as z:
+                  for info in z.infolist():
+                      target = os.path.realpath(os.path.join(dest, info.filename))
+                      if not target.startswith(os.path.realpath(dest) + os.sep) and target != os.path.realpath(dest):
+                          sys.exit("Unsafe path in zip: " + info.filename)
+                  z.extractall(dest)
+                  for info in z.infolist():
+                      p = os.path.join(dest, info.filename)
+                      if os.path.exists(p) and not info.is_dir():
+                          t = time.mktime(tuple(info.date_time) + (0, 0, -1))
+                          os.utime(p, (t, t))
+
+
+          # ------------------------------------------------------------------ 4. detect files inside the extracted mod
+          def detect(root_dir, force_name):
+              mtime = os.path.getmtime
+              cs_files = [p for p in walk(root_dir)
+                          if p.endswith(".cs") and "Template" not in os.path.basename(p) and "AssemblyInfo" not in os.path.basename(p)]
+              texts = {p: strip_comments(open(p, encoding="utf-8-sig", errors="replace").read()) for p in cs_files}
+              decl = {}
+              for p, t in texts.items():
+                  for m in re.finditer(r"\b(partial\s+)?(?:class|struct|interface|enum|record)\s+([A-Za-z_]\w*)", t):
+                      decl.setdefault(m.group(2), []).append((p, bool(m.group(1)) or "partial" in t[max(0, m.start() - 40):m.start() + 20]))
+              loaders = [p for p, t in texts.items() if re.search(r"\bclass\s+\w+\s*:\s*[^{]*\bModLoader\b", t)]
+              if not loaders:
+                  sys.exit("No ModLoader subclass found in this zip.")
+              root = sorted(loaders, key=lambda p: (mtime(p), p))[-1]
+              selected = {root}
+              queue = [root]
+              while queue:
+                  cur = queue.pop()
+                  idents = set(re.findall(r"[A-Za-z_]\w*", texts[cur]))
+                  for name, owners in decl.items():
+                      if name not in idents:
+                          continue
+                      if any(partial for _, partial in owners):
+                          chosen = [p for p, _ in owners]
+                      else:
+                          chosen = [sorted(owners, key=lambda o: (mtime(o[0]), o[0]))[-1][0]]
+                      for p in chosen:
+                          if p not in selected:
+                              selected.add(p)
+                              queue.append(p)
+              infos = [p for p in walk(root_dir) if os.path.basename(p) == "modinfo.json"]
+              near = [p for p in infos if os.path.dirname(p) == os.path.dirname(root)]
+              pool = near or infos
+              if not pool:
+                  sys.exit("No modinfo.json found in this zip.")
+              modinfo = sorted(pool, key=lambda p: (mtime(p), p))[-1]
+              info = json.load(open(modinfo, encoding="utf-8-sig"))
+              missing = [k for k in ["Name", "Version", "ApiVersion", "Description", "ScVersion", "PackageName"] if k not in info]
+              if missing:
+                  sys.exit("modinfo.json is missing: " + ", ".join(missing))
+              pkg = info["PackageName"]
+              if not pkg or ";" in pkg or "\n" in pkg or pkg.lower() in ("survivalcraft", "fastdebug"):
+                  sys.exit("PackageName is not allowed: " + repr(pkg))
+              name = force_name or re.sub(r"[^A-Za-z0-9_]", "", info["Name"]) or re.sub(r"[^A-Za-z0-9_]", "", pkg.split(".")[-1])
+              if not name or name[0].isdigit():
+                  name = "Mod" + name
+              rel = lambda p: os.path.relpath(p, root_dir)
+              print("  mod name      :", name)
+              print("  loader (root) :", rel(root))
+              for p in sorted(selected):
+                  print("     +", rel(p))
+              for p in sorted(set(cs_files) - selected):
+                  print("     - (unused, ignored)", rel(p))
+              print("  modinfo.json  :", rel(modinfo))
+              return name, selected, modinfo
+
+
+          # ------------------------------------------------------------------ 5. inject sources into the template project
+          def prepare(csproj, selected, modinfo):
+              proj_dir = os.path.dirname(csproj)
+              selected_real = {os.path.realpath(p) for p in selected}
+              for d, dirs, files in os.walk(proj_dir):
+                  dirs[:] = [x for x in dirs if x not in ("obj", "bin")]
+                  for f in files:
+                      p = os.path.join(d, f)
+                      if f.endswith(".cs") and os.path.realpath(p) not in selected_real:
+                          os.remove(p)
+              for p in selected:
+                  if not os.path.realpath(p).startswith(os.path.realpath(proj_dir) + os.sep):
+                      target = os.path.join(proj_dir, os.path.basename(p))
+                      if os.path.exists(target):
+                          target = os.path.join(proj_dir, re.sub(r"[^A-Za-z0-9_.]", "_", os.path.basename(os.path.dirname(p)) + "_" + os.path.basename(p)))
+                      shutil.copy(p, target)
+              dst = os.path.join(proj_dir, "modinfo.json")
+              if os.path.realpath(modinfo) != os.path.realpath(dst):
+                  shutil.copy(modinfo, dst)
+              shutil.rmtree(os.path.join(proj_dir, "Assets"), ignore_errors=True)
+              s = open(csproj, encoding="utf-8").read()
+              items = r"(Compile|Content|EmbeddedResource|None|AdditionalFiles|Page)"
+              attr = r'[^>]*?(?:Include|Update)="[^"]*Template[^"]*"[^>]*?'
+              s = re.sub(r"<" + items + r"\b" + attr + r"/>", "", s)
+              s = re.sub(r"<" + items + r"\b" + attr + r">.*?</\1>", "", s, flags=re.S)
+              if re.search(r"<EnableDefaultCompileItems>\s*false", s, re.I):
+                  s = s.replace("</Project>", '  <ItemGroup>\n    <Compile Include="**/*.cs" Exclude="obj/**;bin/**" />\n  </ItemGroup>\n</Project>')
+              open(csproj, "w", encoding="utf-8").write(s)
+              return proj_dir
+
+
+          # ------------------------------------------------------------------ 6. build one zip
+          USED_OUT = set()
+
+
+          def build_one(index, zip_path, template_rel):
+              label = os.path.relpath(zip_path, WS)
+              print("\n" + "=" * 70 + "\nBuilding mod from", label, "\n" + "=" * 70)
+              work = os.path.join(TEMP, "work_%d" % index)
+              shutil.rmtree(work, ignore_errors=True)
+              shutil.copytree(WS, work, ignore=shutil.ignore_patterns(".git", "out", "*.zip"))
+              modroot = os.path.join(work, "__mod")
+              os.makedirs(modroot)
+              unzip(zip_path, modroot)
+              for junk in ("bin", "obj"):
+                  for d, dirs, _ in os.walk(modroot):
+                      if junk in dirs:
+                          shutil.rmtree(os.path.join(d, junk), ignore_errors=True)
+
+              own = sorted(p for p in walk(modroot, {"obj", "bin"}) if p.endswith(".csproj"))
+              name, selected, modinfo = detect(modroot, INPUT_NAME)
+              flags = ["-p:AssemblyName=" + name]
+              if own:
+                  # the zip is a full project: build it as it is (it only gets the template's nuget.config if it has none)
+                  csproj = own[0]
+                  proj_dir = os.path.dirname(csproj)
+                  print("  mode          : the zip has its own project:", os.path.relpath(csproj, modroot))
+                  if not any(f.lower() == "nuget.config" for f in os.listdir(proj_dir)):
+                      for d in (os.path.dirname(os.path.join(work, template_rel)), work):
+                          for f in os.listdir(d):
+                              if f.lower() == "nuget.config":
+                                  shutil.copy(os.path.join(d, f), os.path.join(proj_dir, "nuget.config"))
+                                  break
+                          else:
+                              continue
+                          break
+                  if os.path.realpath(modinfo) != os.path.realpath(os.path.join(proj_dir, "modinfo.json")):
+                      shutil.copy(modinfo, os.path.join(proj_dir, "modinfo.json"))
+                  modinfo = os.path.join(proj_dir, "modinfo.json")
+              else:
+                  print("  mode          : sources only -> injected into the template project")
+                  csproj = os.path.join(work, template_rel)
+                  proj_dir = prepare(csproj, selected, modinfo)
+                  modinfo = os.path.join(proj_dir, "modinfo.json")
+                  flags += ["-p:Nullable=disable", "-p:ImplicitUsings=disable", "-p:TreatWarningsAsErrors=false"]
+
+              cmd = [DOTNET, "build", csproj, "-c", "Release", "-v", "minimal"] + flags
+              print("  $", " ".join(cmd))
+              sys.stdout.flush()
+              if subprocess.run(cmd, cwd=proj_dir).returncode != 0:
+                  sys.exit("dotnet build failed")
+
+              dll = None
+              for p in walk(proj_dir, {"obj"}):
+                  if os.path.basename(p) == name + ".dll" and (os.sep + "bin" + os.sep) in p and "Release" in p:
+                      dll = p
+                      break
+              if not dll:
+                  sys.exit("Built dll %s.dll not found" % name)
+              out_name = name
+              if out_name in USED_OUT:
+                  out_name = name + "_" + re.sub(r"[^A-Za-z0-9_]", "", os.path.splitext(os.path.basename(zip_path))[0])
+              USED_OUT.add(out_name)
+              out_file = os.path.join(OUT, out_name + ".scmod")
+              with zipfile.ZipFile(out_file, "w", zipfile.ZIP_DEFLATED) as z:   # only the mod dll and modinfo.json
+                  z.write(dll, name + ".dll")
+                  z.write(modinfo, "modinfo.json")
+              print("  packaged      :", os.path.relpath(out_file, WS))
+              with zipfile.ZipFile(out_file) as z:
+                  for i in z.infolist():
+                      print("     ", i.filename, i.file_size)
+              return out_name
+
+
+          def main():
+              zips = select_zips()
+              template_rel = locate_template()
+              results = []
+              for i, z in enumerate(zips):
+                  try:
+                      results.append((os.path.relpath(z, WS), build_one(i, z, template_rel), "OK"))
+                  except SystemExit as e:
+                      print("::error::%s: %s" % (os.path.relpath(z, WS), e))
+                      results.append((os.path.relpath(z, WS), "-", "FAILED: %s" % e))
+              lines = ["### scmod build", "", "| zip | output | result |", "|---|---|---|"]
+              for z, n, r in results:
+                  lines.append("| %s | %s | %s |" % (z, (n + ".scmod") if r == "OK" else n, r))
+              summary = os.environ.get("GITHUB_STEP_SUMMARY")
+              if summary:
+                  open(summary, "a").write("\n".join(lines) + "\n")
+              print("\n".join(lines))
+              if any(r != "OK" for _, _, r in results):
+                  sys.exit(1)
+
+
+          main()
           PY
 
-      - name: Restore
-        run: dotnet restore "$(ls ./*.csproj | head -n 1)"
-
-      - name: Build
-        run: >
-          dotnet build "$(ls ./*.csproj | head -n 1)"
-          -c Release --no-restore
-          -p:AssemblyName=${{ steps.mod.outputs.name }}
-          -o out
-
-      - name: Package scmod
-        run: |
-          NAME="${{ steps.mod.outputs.name }}"
-          ROOT="${{ steps.mod.outputs.root }}"
-          test -f "out/$NAME.dll"
-          rm -rf pack && mkdir pack
-          cp "out/$NAME.dll" pack/
-          # copy modinfo.json and any extra non-source files from the mod zip
-          (cd "$ROOT" && find . -type f ! -name '*.cs' ! -name '*.dll' -print0 | xargs -0 -I{} cp --parents {} "$GITHUB_WORKSPACE/pack/")
-          (cd pack && zip -r "../$NAME.scmod" .)
-          unzip -l "$NAME.scmod"
-
-      - name: Upload scmod
+      - name: Upload .scmod files
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ steps.mod.outputs.name }}-scmod
-          path: ${{ steps.mod.outputs.name }}.scmod
+          name: scmod-build
+          path: out/*.scmod
+          if-no-files-found: error
