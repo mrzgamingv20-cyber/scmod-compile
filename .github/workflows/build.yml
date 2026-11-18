@@ -140,6 +140,11 @@ jobs:
                           raise RuntimeError("missing dependency dll %s (put it in libs/ or add the mod's .scmod to the repo)" % n)
                   items = "\n".join('    <Reference Include="%s" Private="false" />' % r for r in refs)
                   pkg = "" if have_game else '    <PackageReference Include="SurvivalcraftAPI.Survivalcraft" Version="1.9.3.1" />\n'
+                  # Harmony: the game ships 0Harmony.dll, so it is only needed at compile time (it is never packed into the .scmod)
+                  uses_harmony = any("HarmonyLib" in open(f, encoding="utf-8-sig", errors="ignore").read() for f in cs)
+                  if uses_harmony and not os.path.exists(os.path.join(LIBS, "0Harmony.dll")):
+                      print("0Harmony.dll not in repo; using NuGet Lib.Harmony for compiling only")
+                      pkg += '    <PackageReference Include="Lib.Harmony" Version="2.3.3" ExcludeAssets="runtime" />\n'
                   csproj = """<Project Sdk="Microsoft.NET.Sdk">
             <PropertyGroup>
               <TargetFramework>net10.0</TargetFramework>
