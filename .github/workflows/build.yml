@@ -1,5 +1,7 @@
-name: Build scmod (zip drop-in)
+name: Build TdmCS
 
+# ONLY builds the mods listed in ONLY_MODS, taken from zips matching ZIP_GLOB (default: TdmCS only, from TdmCS_Paket*.zip).
+# Add ArenaCS to ONLY_MODS if you also want the arena mod, e.g. ONLY_MODS: "TdmCS ArenaCS".
 # HOW TO USE
 #  1. Put this file at .github/workflows/build.yml in your repo.
 #  2. Drop TdmCS_Paket.zip (or any zip that contains mod folders with modinfo.json + .cs files) in the repo root.
@@ -29,8 +31,11 @@ jobs:
           dotnet-version: "10.0.x"
           dotnet-quality: "ga"
 
-      - name: Build every mod found
+      - name: Build the selected mods
         shell: bash
+        env:
+          ZIP_GLOB: "TdmCS_Paket*.zip"
+          ONLY_MODS: "TdmCS"
         run: |
           cat > "$RUNNER_TEMP/build_mods.py" <<'PY'
           import glob, json, os, re, shutil, subprocess, sys, zipfile
@@ -79,7 +84,8 @@ jobs:
                     "Put the three game dlls in libs/ for a reliable build.")
 
           # 2. unpack every zip in the repo
-          for z in glob.glob(os.path.join(ROOT, "**", "*.zip"), recursive=True):
+          zip_glob = os.environ.get("ZIP_GLOB", "*.zip")
+          for z in glob.glob(os.path.join(ROOT, "**", zip_glob), recursive=True):
               if os.sep + "_work" + os.sep in z or os.sep + ".git" + os.sep in z:
                   continue
               dst = os.path.join(SRC, re.sub(r"[^A-Za-z0-9_.-]", "_", os.path.basename(z)))
@@ -92,7 +98,7 @@ jobs:
 
           # 3. find mods (folders with modinfo.json): in unpacked zips and loose in the repo
           mods = {}
-          for base in (SRC, ROOT):
+          for base in (SRC,):
               for p in walk(base):
                   if os.path.basename(p) != "modinfo.json":
                       continue
@@ -105,11 +111,23 @@ jobs:
                       print("::warning::bad modinfo.json %s: %s" % (p, e))
                       continue
                   name = re.sub(r"[^A-Za-z0-9_]", "", info.get("Name", "")) or "Mod"
+                  def vkey(v):
+                      return tuple(int(x) if x.isdigit() else 0 for x in re.split(r"[.\-+]", str(v)))
                   if name in mods:
-                      continue          # first one wins (zip contents are listed before loose files)
+                      # same mod name twice (old zip + new zip): keep the higher Version, tell which one lost
+                      old_folder, old_info = mods[name]
+                      if vkey(info.get("Version", "0")) > vkey(old_info.get("Version", "0")):
+                          print("duplicate %s: using %s (v%s), ignoring %s (v%s)" % (name, folder, info.get("Version"), old_folder, old_info.get("Version")))
+                          mods[name] = (folder, info)
+                      else:
+                          print("duplicate %s: using %s (v%s), ignoring %s (v%s)" % (name, old_folder, old_info.get("Version"), folder, info.get("Version")))
+                      continue
                   mods[name] = (folder, info)
+          only = os.environ.get("ONLY_MODS", "").split()
+          if only:
+              mods = {k: v for k, v in mods.items() if k in only}
           if not mods:
-              print("::error::No mod found. Drop a zip with modinfo.json + .cs files in the repo root.")
+              print("::error::No mod found. Put TdmCS_Paket.zip (with modinfo.json + .cs files) in the repo root.")
               sys.exit(1)
           print("mods found:", sorted(mods))
 
